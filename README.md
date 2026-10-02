@@ -1,38 +1,83 @@
 # Heston Calibration with Neural Networks
 
-An end-to-end Python project calibrating the Heston stochastic volatility model to
-SPX option quotes using a PyTorch implied-volatility surrogate and SciPy optimisation.
-The trained checkpoint and executed notebook are included: no retraining is needed.
+Calibrate the Heston stochastic volatility model to SPX option quotes using a
+**PyTorch implied-volatility surrogate** and **SciPy constrained optimisation**.
+The project connects characteristic-function pricing, numerical IV inversion,
+supervised learning and market calibration in five focused Python modules.
 
-## Motivation
+**A trained checkpoint and an executed notebook are included. No retraining is required.**
 
-Direct Heston IV evaluation requires numerical integration of the characteristic
-function followed by a scalar root solve for implied volatility. The trained
-PyTorch surrogate replaces both steps with a single neural-network forward pass.
-Offline label generation and training are separate from online inference time.
+[Explore the notebook](notebooks/heston_calibration.ipynb) · [Run the project](#quick-start) · [Data assumptions](data/README.md)
 
-## Approach
+## Results at a glance
 
-1. Price European calls using the stable Heston characteristic function.
-2. Invert Black–Scholes with `scipy.optimize.brentq`.
-3. Generate 50,000 valid synthetic observations with a fixed seed.
-4. Train a seven-input PyTorch surrogate for log implied volatility.
-5. Fit five Heston parameters with SciPy L-BFGS-B and box constraints.
-6. Apply the fit to mids of a supplied snapshot of SPX option quotes.
+| Measurement | Recorded result |
+|---|---:|
+| Surrogate test MAE / RMSE | **6.33 / 8.86 IV bp** |
+| SPX in-sample fit MAE / RMSE | **27.89 / 38.70 IV bp** |
+| Numerical Heston IV evaluation | **7.37 ms per option** |
+| Neural IV evaluation, batch of 200 | **0.00237 ms per option** |
+| Batched IV evaluation speedup versus scalar adaptive integration | **3,104×** |
 
-The scalar reference uses adaptive integration over `[0, infinity)`.
-Training uses vectorised Gauss-Legendre integration of the **same** P1/P2 formula,
-checked at 384/400 and 768/800 nodes/cutoff. Every accepted label uses Brent IV
-inversion. Unstable or low-vega labels are rejected rather than clipped.
+One IV basis point is `0.0001` in decimal volatility. Synthetic test metrics use
+5,000 held-out observations; the SPX fit uses 2,130 calls across 14 maturities.
+The speedup compares **Heston integration + Brent inversion** with **batched neural
+inference**, including preprocessing. It is not a full-calibration speedup or a
+comparison against an optimised vectorised numerical pricer.
 
-## Model
+![Observed SPX IV versus neural IV at calibrated Heston parameters](figures/spx_fit.png)
+
+*Each point is a fitted SPX quote; the dashed line represents a perfect fit.
+The fit is in-sample, under the documented rate and dividend assumptions.*
+
+## Why use a surrogate?
+
+A calibration algorithm evaluates many candidate Heston parameter vectors. Each
+candidate requires an implied volatility for every option: integrate the Heston
+characteristic function to obtain a price, then invert Black–Scholes numerically.
+A trained neural network approximates this mapping with a fast forward pass.
+
+The network predicts **IV from parameters and a contract**. SciPy then searches
+for the five Heston parameters that best match the observed IVs.
+
+1. **Generate labels:** sample Heston parameters, moneyness and maturity; compute call prices and invert them with Brent.
+2. **Train offline:** learn the seven-input mapping to log-IV using PyTorch.
+3. **Calibrate online:** evaluate candidate parameters in batches and minimise IV error with L-BFGS-B.
+4. **Check the result:** compare the fitted surface with SPX quotes and reprice selected contracts numerically.
+
+## Quick start
+
+From a terminal on macOS or Linux:
+
+```bash
+git clone https://github.com/matteomatraxia26/heston-neural-calibration.git
+cd heston-neural-calibration
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+pytest -q
+python scripts/benchmark.py
+jupyter notebook notebooks/heston_calibration.ipynb
+```
+
+The benchmark and notebook load `models/heston_nn.pt`. They run on CPU without a GPU.
+On Windows, activate the virtual environment with `.venv\Scripts\Activate.ps1` in PowerShell.
+
+Optional full retraining: `python scripts/train_model.py`. This regenerates the
+synthetic labels and **overwrites the checkpoint**. To execute the notebook from the terminal:
+
+```bash
+jupyter nbconvert --to notebook --execute notebooks/heston_calibration.ipynb --inplace
+```
+
+## Model and numerical pricing
 
 Under the risk-neutral measure:
 
-$$dS_t=(r-q)S_tdt+\sqrt{v_t}S_tdW_t^S,$$
-$$dv_t=\kappa(\theta-v_t)dt+\xi\sqrt{v_t}dW_t^v,\quad d\langle W^S,W^v\rangle_t=\rho dt.$$
+$$dS_t=(r-q)S_t\,dt+\sqrt{v_t}S_t\,dW_t^S,$$
+$$dv_t=\kappa(\theta-v_t)\,dt+\xi\sqrt{v_t}\,dW_t^v,\qquad d\langle W^S,W^v\rangle_t=\rho\,dt.$$
 
-| Parameter | Meaning | Training and calibration bounds |
+| Parameter | Interpretation | Training and calibration bounds |
 |---|---|---|
 | `kappa` | Mean-reversion speed | 0.1–5.0 |
 | `theta` | Long-run variance | 0.005–0.15 |
@@ -40,38 +85,29 @@ $$dv_t=\kappa(\theta-v_t)dt+\xi\sqrt{v_t}dW_t^v,\quad d\langle W^S,W^v\rangle_t=
 | `rho` | Spot/variance correlation | −0.95–−0.05 |
 | `v0` | Initial variance | 0.005–0.15 |
 
-The call price is `S exp(-qT) P1 - K exp(-rT) P2`, with P1/P2 obtained from CF
-integrals. The stable square-root formulation uses a decaying exponential,
-rationalisation, `log1p` and `expm1`. Numerical tolerances still apply.
+European calls use `C = S exp(-qT) P1 - K exp(-rT) P2`, with P1/P2 obtained by
+integrating the characteristic function. The scalar reference uses SciPy adaptive
+quadrature over the infinite interval. Label generation uses vectorised
+Gauss–Legendre quadrature of the same formula, checked at two resolutions.
+Unstable and low-vega labels are rejected. Every accepted label uses Brent IV inversion.
 
-## Neural Surrogate
+## Neural surrogate and calibration
 
-Exactly seven inputs: `(kappa, theta, xi, rho, v0, K/S, T)`.
-Architecture: `7 → 128 → 128 → 128 → 1`, tanh hidden layers, log-IV output.
-Exponentiation produces positive decimal IV; one IV basis point is `0.0001`.
+The mapping is `(kappa, theta, xi, rho, v0, K/S, T) → log(IV)`.
+The MLP has three 128-unit tanh hidden layers; exponentiation produces positive IV.
 
-Input means and standard deviations are fitted only on the 40,000 training rows.
-There are 5,000 validation and 5,000 test rows. Adam, mini-batches, MSE in log-IV
-and validation early stopping use seed 42. The run completed 600 epochs; epoch 594
-was restored before evaluating the test set. PyTorch uses float64 so SciPy's small
-finite-difference perturbations remain observable. The single `.pt` state dictionary
-includes scaler buffers, domain and training metrics; loading uses `weights_only=True`.
+Training uses 50,000 accepted numerical labels, an 80/10/10 split, training-only
+input standardisation, Adam and validation-based checkpoint selection with early
+stopping. Seeds are fixed. Float64 preserves the small input perturbations used
+by SciPy's finite differences. The checkpoint includes weights and scaler buffers.
 
-Moneyness is uniform on `[0.8,1.2]`; maturity is log-uniform on `[0.1,2.0]` years.
-This focuses the experiment and avoids extrapolation at extreme strikes or very
-short maturities. Carry is fixed at `r=0.045`, `q=0.012` in labels and market IVs.
-Changing carry requires regenerating labels and retraining: it is not an extra input.
+The domain is `0.8 ≤ K/S ≤ 1.2` and `0.1 ≤ T ≤ 2.0` years. Parameters and moneyness
+are sampled uniformly; maturity is log-uniform. The checkpoint assumes fixed
+`r = 4.5%` and `q = 1.2%`; varying carry is not supported by the seven-input interface.
 
-## Calibration
-
-Minimise mean squared error between neural IV and observed mid-price IV.
-`scipy.optimize.minimize(method="L-BFGS-B")` uses one starting point, finite
-differences and the training parameter bounds. A linear unit-box rescaling balances
-parameter units. No analytic network Jacobian is supplied.
-
-The notebook first recovers a known synthetic surface (fit RMSE **2.61 IV bp**),
-then fits **2,130 SPX calls across 14 maturities**. Market calibration converged in
-30 iterations, taking 0.867 s in the recorded run, with MSE `1.49766e-5`.
+Calibration minimises mean squared error between neural IV and observed mid-price IV.
+L-BFGS-B uses the training bounds, numerical differences, one initial guess and a
+linear parameter rescaling to a unit box. No analytic network Jacobian is supplied.
 
 | Parameter | SPX estimate |
 |---|---:|
@@ -81,90 +117,70 @@ then fits **2,130 SPX calls across 14 maturities**. Market calibration converged
 | rho | −0.773514 |
 | v0 | 0.037475 |
 
-`xi` reaches its upper bound: this is an optimum within the trained box, not an
-unrestricted optimum. The Feller margin `2*kappa*theta-xi**2` is **−1.78745**.
-Feller positivity is reported, not constrained; its failure does not invalidate pricing.
+The fit converged in 30 iterations, taking 0.87 s in the recorded run. **`xi` reaches
+its upper bound:** this is a converged solution within the trained box; global
+optimality is not established. The Feller margin is −1.78745. Feller positivity is
+reported rather than imposed; its failure does not invalidate Heston pricing.
 
-## Results
+## Validation and benchmark details
 
-| Measurement | Recorded result |
-|---|---:|
-| Synthetic test MAE / RMSE | **6.33 / 8.86 IV bp** |
-| Synthetic test maximum error | 108.92 IV bp |
-| SPX in-sample MAE / RMSE | **27.89 / 38.70 IV bp** |
-| Adaptive Heston + Brent, per option | **7.37118 ms** |
-| PyTorch IV, per option in a 200-option batch | **0.00237440 ms** |
-| Measured IV evaluation speedup | **3,104×** |
-| Benchmark prediction MAE / RMSE | 3.80 / 4.80 IV bp |
-| Label generation / training | 9.83 / 78.63 s |
+**10 tests passed; all 11 notebook code cells executed without errors.** Tests cover
+IV inversion, numerical pricing, label consistency, quote cleaning, checkpoint
+loading, training-only scaling and bounded optimisation.
 
-Primary timing comes from the standalone `scripts/benchmark.py` run. The same
-benchmark inside Jupyter measured **3,978×** (9.48586 / 0.00238458 ms per option).
-Both are retained to show run-to-run variability; the smaller standalone result is
-used above. These are CPU batch-throughput measurements, **not full calibration
-speedups or isolated-request latencies**. Scaling, tensor conversion, exponentiation
-and NumPy output conversion are included; training and checkpoint loading are excluded.
-The benchmark warms up, then uses three reference repetitions and nine groups of
-100 neural batches, reporting median times on the same 200 seeded options.
+The notebook also demonstrates synthetic parameter recovery (IV fit RMSE 2.61 bp).
+On 30 SPX quotes repriced at the fitted parameters, numerical Heston versus market
+RMSE is 60.53 bp; neural versus numerical Heston RMSE is 9.85 bp. This subset differs
+from the full fitted sample. Synthetic test maximum error is 108.92 bp, so average
+accuracy should not be interpreted as a worst-case guarantee.
 
-A separate 30-quote check at the SPX fitted parameters gives numerical Heston versus
-market RMSE **60.53 IV bp**, and neural versus numerical RMSE **9.85 IV bp**.
-This subset differs from the full market set; surrogate fit and direct model fit
-are distinct measurements. See the executed notebook for outputs and parameters.
+<details>
+<summary>Timing protocol, secondary run and recorded environment</summary>
 
-Validation: **10 tests passed in 1.82 s; all 11 notebook code cells executed without
-errors.** Results were produced in the supplied local macOS arm64 CPU run with one
-PyTorch thread: Python 3.14.4, NumPy 2.5.3, SciPy 1.18.1, pandas 2.3.3,
-PyTorch 2.14.1, Matplotlib 3.11.2, pytest 9.1.1. This is the recorded environment,
-not a claim of identical timings or bitwise training results on other platforms.
+The primary benchmark is the standalone script: the same 200 seeded contracts and
+one fixed Heston parameter vector are evaluated by both methods. After warm-up,
+reference timing uses three repetitions; neural timing uses nine groups of 100
+batches. Reported times are medians, divided by the batch size.
 
-## Example Result
+Neural timing includes input checks, tensor conversion, standardisation, forward
+pass, exponentiation and output conversion. Label generation, training and loading
+the checkpoint are excluded. Benchmark prediction MAE/RMSE is 3.80/4.80 IV bp.
 
-![SPX in-sample calibration](figures/spx_fit.png)
+A second run in the notebook measured 3,978× (9.49 ms versus 0.00238 ms per option).
+The table uses the smaller standalone result; both runs illustrate timing variability.
+Offline label generation took 9.83 s and training 78.63 s. Training completed 600
+epochs and restored epoch 594, selected using validation loss.
 
-## Repository Structure
+Recorded local environment: macOS 26.5.1 arm64, Python 3.14.4, NumPy 2.5.3,
+SciPy 1.18.1, pandas 2.3.3, PyTorch 2.14.1, Matplotlib 3.11.2 and pytest 9.1.1.
+Inference uses CPU, one PyTorch thread and float64. Timings and training results
+can vary across hardware and software environments.
+
+</details>
+
+## Repository map
 
 | Path | Purpose |
 |---|---|
-| `src/black_scholes.py` | Call pricing and Brent inversion |
-| `src/heston.py` | Stable CF and numerical integration |
-| `src/data.py` | Synthetic labels and SPX cleaning |
-| `src/neural_network.py` | PyTorch training, prediction and checkpoint |
-| `src/calibration.py` | Five-parameter SciPy optimisation |
-| `scripts/train_model.py` | Optional label regeneration and training |
-| `scripts/benchmark.py` | Repeated CPU IV throughput comparison |
-| `notebooks/heston_calibration.ipynb` | Executed six-section walkthrough |
-| `tests/test_core.py` | Ten focused numerical and pipeline tests |
-| `data/spx_options.csv` | Minimal supplied quotes; assumptions in `data/README.md` |
-| `models/heston_nn.pt` | Trained PyTorch checkpoint |
+| `src/black_scholes.py` | European calls and Brent IV inversion |
+| `src/heston.py` | Stable characteristic function and numerical integration |
+| `src/data.py` | Synthetic labels and SPX quote cleaning |
+| `src/neural_network.py` | PyTorch training, inference and checkpoint handling |
+| `src/calibration.py` | Five-parameter bounded SciPy optimisation |
+| `scripts/` | Training and CPU benchmark entry points |
+| `notebooks/heston_calibration.ipynb` | Executed walkthrough and calibration results |
+| `tests/test_core.py` | Ten focused tests |
+| `data/`, `models/`, `figures/` | SPX quotes, trained checkpoint and fit plot |
 
-## Quick Start
+## Limitations and data source
 
-From the extracted repository root, in a Python environment with the dependencies:
+- One supplied SPX snapshot is fitted in-sample, using assumed flat carry. Source dates and maturity conventions remain unresolved; see [the data notes](data/README.md).
+- The active `xi` bound restricts the fit. A wider training domain would require new labels and retraining; one start does not establish a global optimum.
+- Label rejection changes the accepted distribution. Accuracy outside the training domain is unsupported, and the neural surface is not constrained to be arbitrage-free.
+- The speedup is specific to the scalar adaptive reference and batch size. It does not establish the same gain over vectorised quadrature or for an entire calibration.
 
-```bash
-python -m pip install -r requirements.txt
-pytest -q
-python scripts/benchmark.py
-jupyter notebook notebooks/heston_calibration.ipynb
-```
-
-Optional full retraining: `python scripts/train_model.py` (overwrites the checkpoint).
-To rerun the notebook non-interactively:
-
-```bash
-jupyter nbconvert --to notebook --execute notebooks/heston_calibration.ipynb --inplace
-```
-
-## Limitations
-
-- The market fit is in-sample under assumed carry and supplied maturity conventions;
-  the snapshot date is inconsistent across source materials (see `data/README.md`).
-- The SPX optimum hits the `xi` bound. Expanding it requires new labels and retraining.
-- Label rejection means measured synthetic accuracy describes accepted observations,
-  not a uniform error guarantee throughout the training box.
-- The neural surface is not constrained to be arbitrage-free; parameters need not be unique.
-- Speedup depends on hardware, batch size and the chosen numerical reference.
-
-The numerical core is a simplification of the main supplied project. The reference
-archive supplied the SPX quotes and inspiration for a linear seven-input workflow.
+The SPX data is a reduced extract of `SPX_data_26.02.24.csv` from the
+`Fast-Calibration-of-Heston-Model` reference project, which also inspired the linear
+workflow. The stable numerical routines were refactored from the earlier
+Heston Calibration Lab implementation. The current PyTorch checkpoint was trained
+on newly generated numerical labels, not on weights from the reference project.
